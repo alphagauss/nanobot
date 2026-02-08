@@ -15,7 +15,11 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
-
+from nanobot.agent.tools.offloader import (
+    ToolResponseOffloader,
+    ReadArtifactTool, TailArtifactTool, SearchArtifactTool
+)
+from nanobot.config.schema import OffloadConfig
 
 class SubagentManager:
     """
@@ -35,6 +39,7 @@ class SubagentManager:
         temperature: float = 0.7,
         max_tokens: int = 4096,
         brave_api_key: str | None = None,
+        offload_config: OffloadConfig | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
     ):
@@ -46,6 +51,8 @@ class SubagentManager:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.brave_api_key = brave_api_key
+        self.offload_config = offload_config
+        self.offloader = ToolResponseOffloader(workspace, config=offload_config) if offload_config else None
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
@@ -114,7 +121,13 @@ class SubagentManager:
             ))
             tools.register(WebSearchTool(api_key=self.brave_api_key))
             tools.register(WebFetchTool())
-            
+
+            # Register artifact tools if offloader is enabled
+            if self.offloader and self.offload_config and self.offload_config.enabled:
+                tools.register(ReadArtifactTool(self.offloader))
+                tools.register(TailArtifactTool(self.offloader))
+                tools.register(SearchArtifactTool(self.offloader))
+
             # Build messages with subagent-specific prompt
             system_prompt = self._build_subagent_prompt(task)
             messages: list[dict[str, Any]] = [
@@ -162,6 +175,13 @@ class SubagentManager:
                         args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                         logger.debug("Subagent [{}] executing: {} with arguments: {}", task_id, tool_call.name, args_str)
                         result = await tools.execute(tool_call.name, tool_call.arguments)
+
+                        # Check for offloading
+                        if self.offloader and self.offloader.should_offload(tool_call.name, result):
+                            offload_res = self.offloader.offload(tool_call.name, result)
+                            result = offload_res.context_message
+                            # No UI notification for subagent offloading to avoid spam
+   
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
@@ -250,7 +270,13 @@ You are a subagent spawned by the main agent to complete a specific task.
 Your workspace is at: {self.workspace}
 Skills are available at: {self.workspace}/skills/ (read SKILL.md files as needed)
 
-When you have completed the task, provide a clear summary of your findings or actions."""
+When you have completed the task, provide a clear summary of your findings or actions.
+
+## Tool Response Offloading
+To prevent context bloat, large tool responses will be automatically offloaded to the file system.
+When this happens, you will see a [TOOL RESPONSE OFFLOADED] message with a preview.
+If the preview is insufficient, use the `read_artifact(artifact_id)` tool to read the full content.
+Output from `read_artifact` is NEVER offloaded, so you can always see the full content safely."""
     
     def get_running_count(self) -> int:
         """Return the number of currently running subagents."""

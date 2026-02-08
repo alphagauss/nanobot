@@ -301,7 +301,10 @@ def gateway(
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
-    
+
+    # Ensure automated cleanup job exists and is up to date
+    _ensure_cleanup_job(cron, config.tools.offload)
+
     # Create agent with cron service
     agent = AgentLoop(
         bus=bus,
@@ -313,6 +316,7 @@ def gateway(
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
         brave_api_key=config.tools.web.search.api_key or None,
+        offload_config=config.tools.offload,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
@@ -467,6 +471,7 @@ def agent(
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
         brave_api_key=config.tools.web.search.api_key or None,
+        offload_config=config.tools.offload,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
@@ -1115,6 +1120,43 @@ def _login_github_copilot() -> None:
     except Exception as e:
         console.print(f"[red]Authentication error: {e}[/red]")
         raise typer.Exit(1)
+
+
+def _ensure_cleanup_job(cron_service: "CronService", offload_config: "OffloadConfig"):
+    """
+    Ensure the artifact cleanup job exists and uses current configuration.
+    If 'artifact_cleanup' exists, it is removed and recreated to ensure
+    settings (like retention days in the prompt) are up to date.
+    """
+    from nanobot.cron.types import CronSchedule
+    
+    if not offload_config.enabled:
+        return
+
+    JOB_NAME = "artifact_cleanup"
+    
+    # Check for existing job
+    existing_jobs = cron_service.list_jobs(include_disabled=True)
+    for job in existing_jobs:
+        if job.name == JOB_NAME:
+            cron_service.remove_job(job.id)
+            break
+            
+    # Create new job
+    # Run daily (86400 seconds)
+    # Be explicit about retention days in the prompt so the agent sees it
+    days = offload_config.retention_days
+    message = (
+        f"SYSTEM MAINTENANCE: Please run the 'cleanup_artifacts' tool to delete "
+        f"tool response files older than {days} days."
+    )
+    
+    cron_service.add_job(
+        name=JOB_NAME,
+        schedule=CronSchedule(kind="every", every_ms=86400 * 1000), # Daily
+        message=message,
+        deliver=False
+    )
 
 
 if __name__ == "__main__":

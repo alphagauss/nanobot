@@ -181,6 +181,30 @@ class ChannelsConfig(Base):
     qq: QQConfig = Field(default_factory=QQConfig)
 
 
+class OffloadConfig(Base):
+    """Tool response offloading configuration."""
+    enabled: bool = True
+    threshold_tokens: int = 500
+    threshold_bytes: int = 2000
+    max_preview_tokens: int = 150
+    max_preview_lines: int = 10
+    storage_dir: str = ".artifacts"
+    retention_days: int = 7
+    include_metadata: bool = True
+
+
+class OffloadConfig(BaseModel):
+    """Tool response offloading configuration."""
+    enabled: bool = True
+    threshold_tokens: int = 500
+    threshold_bytes: int = 2000
+    max_preview_tokens: int = 150
+    max_preview_lines: int = 10
+    storage_dir: str = ".artifacts"
+    retention_days: int = 7
+    include_metadata: bool = True
+
+
 class AgentDefaults(Base):
     """Default agent configuration."""
 
@@ -269,6 +293,7 @@ class ToolsConfig(Base):
     """Tools configuration."""
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
+    offload: OffloadConfig = Field(default_factory=OffloadConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)

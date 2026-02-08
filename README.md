@@ -740,6 +740,15 @@ That's it! Environment variables, model prefixing, config matching, and `nanobot
 
 </details>
 
+### Context Management (Tool Offloading)
+
+nanobot automatically prevents context bloat by offloading large tool responses to disk.
+
+| Config | Env Var | Default | Description |
+|--------|---------|---------|-------------|
+| `enabled` | `NANOBOT_TOOLS__OFFLOAD__ENABLED` | `true` | Enable/disable offloading |
+| `threshold_tokens` | `NANOBOT_TOOLS__OFFLOAD__THRESHOLD_TOKENS` | `500` | Max tokens before offloading |
+| `retention_days` | `NANOBOT_TOOLS__OFFLOAD__RETENTION_DAYS` | `7` | Days to keep offloaded files |
 
 ### MCP (Model Context Protocol)
 
@@ -806,6 +815,50 @@ MCP tools are automatically discovered and registered on startup. The LLM can us
 | `tools.restrictToWorkspace` | `false` | When `true`, restricts **all** agent tools (shell, file read/write/edit, list) to the workspace directory. Prevents path traversal and out-of-scope access. |
 | `channels.*.allowFrom` | `[]` (allow all) | Whitelist of user IDs. Empty = allow everyone; non-empty = only listed users can interact. |
 
+<details>
+<summary><b>Full config example</b></summary>
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": "anthropic/claude-opus-4-5"
+    }
+  },
+  "providers": {
+    "openrouter": {
+      "apiKey": "sk-or-v1-xxx"
+    },
+    "groq": {
+      "apiKey": "gsk_xxx"
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "token": "123456:ABC...",
+      "allowFrom": ["123456789"]
+    },
+    "whatsapp": {
+      "enabled": false
+    }
+  },
+  "tools": {
+    "web": {
+      "search": {
+        "apiKey": "BSA..."
+      },
+      "offload": {
+        "enabled": true,
+        "thresholdTokens": 1000,
+        "retentionDays": 30
+      }
+    }
+  }
+}
+```
+
+</details>
 
 ## CLI Reference
 
