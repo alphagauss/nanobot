@@ -5,6 +5,7 @@ import mimetypes
 import platform
 from pathlib import Path
 from typing import Any
+from loguru import logger
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
@@ -107,7 +108,13 @@ For normal conversation, just respond with text - do not call the message tool.
 
 Always be helpful, accurate, and concise. Before calling tools, briefly tell the user what you're about to do (one short sentence in the user's language).
 When remembering something important, write to {workspace_path}/memory/MEMORY.md
-To recall past events, grep {workspace_path}/memory/HISTORY.md"""
+To recall past events, grep {workspace_path}/memory/HISTORY.md
+
+## Tool Response Offloading
+To prevent context bloat, large tool responses will be automatically offloaded to the file system.
+When this happens, you will see a [TOOL RESPONSE OFFLOADED] message with a preview.
+If the preview is insufficient, use the `read_artifact(artifact_id)` tool to read the full content.
+Output from `read_artifact` is NEVER offloaded, so you can always see the full content safely."""
     
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""

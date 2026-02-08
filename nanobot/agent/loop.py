@@ -24,7 +24,12 @@ from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import Session, SessionManager
+from nanobot.agent.tools.offloader import (
+    ToolResponseOffloader,
+    ReadArtifactTool, TailArtifactTool, SearchArtifactTool, ListArtifactsTool
+)
 
+from nanobot.config.schema import OffloadConfig
 
 class AgentLoop:
     """
@@ -49,6 +54,7 @@ class AgentLoop:
         max_tokens: int = 4096,
         memory_window: int = 50,
         brave_api_key: str | None = None,
+        offload_config: OffloadConfig | None = None,
         exec_config: "ExecToolConfig | None" = None,
         cron_service: "CronService | None" = None,
         restrict_to_workspace: bool = False,
@@ -81,10 +87,14 @@ class AgentLoop:
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             brave_api_key=brave_api_key,
+            offload_config=offload_config,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
         )
-        
+
+        # Initialize output offloader
+        self.offloader = ToolResponseOffloader(workspace, config=offload_config)
+
         self._running = False
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
@@ -122,6 +132,12 @@ class AgentLoop:
         # Cron tool (for scheduling)
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+
+        # Artifact tools (for offloaded content)
+        self.tools.register(ReadArtifactTool(self.offloader))
+        self.tools.register(TailArtifactTool(self.offloader))
+        self.tools.register(SearchArtifactTool(self.offloader))
+        self.tools.register(ListArtifactsTool(self.offloader))
     
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -221,6 +237,13 @@ class AgentLoop:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+
+                    if self.offloader.should_offload(tool_call.name, result):
+                        offload_res = self.offloader.offload(tool_call.name, result)
+                        result = offload_res.context_message
+                        # Notify user of offload (non-blocking)
+                        logger.info(f"📁 **Tool Response Offloaded**\nSaved `{offload_res.original_tokens}` tokens from `{tool_call.name}` to `{offload_res.artifact_id}`.")
+
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -229,7 +252,6 @@ class AgentLoop:
                 break
 
         return final_content, tools_used
-
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
         self._running = True
