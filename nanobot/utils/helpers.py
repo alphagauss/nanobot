@@ -9,10 +9,13 @@ def ensure_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
 
+def get_root_path() -> Path:
+    """Get the current root path for nanobot data."""
+    return Path.home()
 
 def get_data_path() -> Path:
-    """Get the nanobot data directory (~/.nanobot)."""
-    return ensure_dir(Path.home() / ".nanobot")
+    """Get the nanobot data directory (~/.nanobot or custom root)."""
+    return ensure_dir(get_root_path() / ".nanobot")
 
 
 def get_workspace_path(workspace: str | None = None) -> Path:
@@ -28,7 +31,7 @@ def get_workspace_path(workspace: str | None = None) -> Path:
     if workspace:
         path = Path(workspace).expanduser()
     else:
-        path = Path.home() / ".nanobot" / "workspace"
+        path = get_root_path() / ".nanobot" / "workspace"
     return ensure_dir(path)
 
 
