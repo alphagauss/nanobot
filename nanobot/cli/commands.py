@@ -391,8 +391,8 @@ def gateway(
         workspace=config.workspace_path,
         on_heartbeat=on_heartbeat,
         on_notify=on_heartbeat_notify,
-        interval_s=30 * 60,  # 30 minutes
-        enabled=True
+        interval_s=config.heartbeat.interval_s,
+        enabled=True,
     )
     
     if channels.enabled_channels:
@@ -404,7 +404,7 @@ def gateway(
     if cron_status["jobs"] > 0:
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
     
-    console.print(f"[green]✓[/green] Heartbeat: every 30m")
+    console.print(f"[green]✓[/green] Heartbeat: every {config.heartbeat.interval_s // 60}m")
     
     async def run():
         try:
