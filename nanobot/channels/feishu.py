@@ -8,7 +8,8 @@ import threading
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
-
+from pathlib import Path
+import httpx
 from loguru import logger
 
 from nanobot.bus.events import OutboundMessage
@@ -730,4 +731,4 @@ class FeishuChannel(BaseChannel):
             )
 
         except Exception as e:
-            logger.error("Error processing Feishu message: {}", e)
+            logger.error(f"Error processing Feishu message: {e}")
