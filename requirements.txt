@@ -16,3 +16,4 @@ anyio>=4.0.0,
 tiktoken
 prompt-toolkit>=3.0.0
 python-socks[asyncio]
+a2a-sdk[http-server]>=0.2.0
