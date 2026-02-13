@@ -164,6 +164,22 @@ class QQConfig(Base):
     secret: str = ""  # 机器人密钥 (AppSecret) from q.qq.com
     allow_from: list[str] = Field(default_factory=list)  # Allowed user openids (empty = public access)
 
+class A2AConfig(BaseModel):
+    """A2A Protocol channel configuration.
+    
+    Exposes nanobot as an A2A-compatible agent that other agents can discover
+    and communicate with. See: https://a2a-protocol.org
+    """
+    enabled: bool = False
+    host: str = "0.0.0.0"
+    port: int = 8080
+    public_host: str | None = None  # Public URL for agent card (e.g., https://myagent.example.com)
+    streaming: bool = True  # Enable streaming responses
+    request_timeout: int = 300  # Timeout for processing requests (seconds)
+    skills: list[dict] = Field(default_factory=list)  # Additional skills to advertise
+    # Authentication (optional)
+    auth_token: str | None = None  # Bearer token for authenticated requests
+
 
 class ChannelsConfig(Base):
     """Configuration for chat channels."""
@@ -179,6 +195,7 @@ class ChannelsConfig(Base):
     email: EmailConfig = Field(default_factory=EmailConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
     qq: QQConfig = Field(default_factory=QQConfig)
+    a2a: A2AConfig = Field(default_factory=A2AConfig)
 
 
 class OffloadConfig(Base):

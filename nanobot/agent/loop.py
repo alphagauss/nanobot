@@ -21,6 +21,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.agent.tools import A2A_TOOL_AVAILABLE
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
@@ -138,6 +139,11 @@ class AgentLoop:
         self.tools.register(TailArtifactTool(self.offloader))
         self.tools.register(SearchArtifactTool(self.offloader))
         self.tools.register(ListArtifactsTool(self.offloader))
+
+        # A2A client tool (for calling other A2A agents)
+        if A2A_TOOL_AVAILABLE:
+            from nanobot.agent.tools.a2a_client import A2AClientTool
+            self.tools.register(A2AClientTool())
     
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""

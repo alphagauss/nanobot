@@ -1068,3 +1068,46 @@ PRs welcome! The codebase is intentionally small and readable. 🤗
 <p align="center">
   <sub>nanobot is for educational, research, and technical exchange purposes only</sub>
 </p>
+
+<details>
+<summary><b>A2A Protocol</b> (Agent-to-Agent)</summary>
+
+Expose your nanobot as an A2A-compatible agent that other agents can discover and call.
+
+```bash
+pip install "nanobot-ai[a2a]"
+```
+
+**Configure**
+
+```json
+{
+  "channels": {
+    "a2a": {
+      "enabled": true,
+      "port": 8080,
+      "publicHost": "https://my-agent.example.com"
+    }
+  }
+}
+```
+
+**Run**
+
+```bash
+nanobot gateway
+```
+
+Your agent will be discoverable at:
+- Agent Card: `http://localhost:8080/.well-known/agent.json`
+- A2A Endpoint: `http://localhost:8080/`
+
+nanobot can also **call other A2A agents** using the built-in `call_a2a_agent` tool:
+
+```
+User: Ask the travel agent at https://travel.example.com to book a flight to Paris
+```
+
+See [A2A Protocol](https://a2a-protocol.org) for more info.
+
+</details>
