@@ -75,7 +75,8 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
-
+        self.offload_config = offload_config
+        
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
@@ -132,6 +133,9 @@ class AgentLoop:
         # Cron tool (for scheduling)
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+
+        # Initialize output offloader
+        self.offloader = ToolResponseOffloader(self.workspace, config=self.offload_config)
 
         # Artifact tools (for offloaded content)
         self.tools.register(ReadArtifactTool(self.offloader))
@@ -372,7 +376,7 @@ class AgentLoop:
         session.add_message("assistant", final_content,
                             tools_used=tools_used if tools_used else None)
         self.sessions.save(session)
-        
+
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
