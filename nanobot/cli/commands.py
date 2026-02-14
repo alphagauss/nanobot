@@ -421,7 +421,12 @@ def gateway(
     )
     
     # Create channel manager
-    channels = ChannelManager(config, bus)
+    channels = ChannelManager(
+        config,
+        bus,
+        session_manager=session_manager,
+        cron_service=cron,
+    )
     
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
@@ -638,6 +643,14 @@ def channels_status():
         "Slack",
         "✓" if slack.enabled else "✗",
         slack_config
+    )
+
+    # web server
+    web = config.channels.web
+    table.add_row(
+        "Web",
+        "✓" if web.enabled else "✗",
+        f"{web.host}:{web.port}"
     )
 
     console.print(table)
@@ -1054,6 +1067,29 @@ def _ensure_cleanup_job(cron_service: "CronService", offload_config: "OffloadCon
         deliver=False
     )
 
+
+# ============================================================================
+# TUI Command
+# ============================================================================
+
+
+@app.command()
+def tui(
+    api_url: str = typer.Option("http://localhost:18790", "--api", help="Gateway HTTP API URL"),
+):
+    """Start TUI mode for interactive input (connects to gateway API)."""
+    from tui.app import TUIInput
+    
+    tui_input = TUIInput(gateway_url=api_url)
+    
+    async def run():
+        try:
+            await tui_input.start()
+        except KeyboardInterrupt:
+            pass
+    
+    asyncio.run(run())
+    
 
 if __name__ == "__main__":
     app()
