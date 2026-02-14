@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from loguru import logger
 
@@ -11,6 +11,10 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Config
+
+if TYPE_CHECKING:
+    from nanobot.cron.service import CronService
+    from nanobot.session.manager import SessionManager
 
 
 class ChannelManager:
@@ -23,9 +27,17 @@ class ChannelManager:
     - Route outbound messages
     """
     
-    def __init__(self, config: Config, bus: MessageBus):
+    def __init__(
+        self,
+        config: Config,
+        bus: MessageBus,
+        session_manager: "SessionManager | None" = None,
+        cron_service: "CronService | None" = None,
+    ):
         self.config = config
         self.bus = bus
+        self.session_manager = session_manager
+        self.cron_service = cron_service
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
         
@@ -150,6 +162,22 @@ class ChannelManager:
                 logger.info(f"A2A channel enabled on port {self.config.channels.a2a.port}")
             except ImportError as e:
                 logger.warning(f"A2A channel not available: {e}. Install with: pip install 'a2a-sdk[http-server]'")
+
+        # Web backend channel
+        if self.config.channels.web.enabled:
+            try:
+                from nanobot.channels.web import WebChannel
+
+                self.channels["web"] = WebChannel(
+                    self.config.channels.web,
+                    self.bus,
+                    session_manager=self.session_manager,
+                    full_config=self.config,
+                    cron_service=self.cron_service,
+                )
+                logger.info("Web channel enabled")
+            except ImportError as e:
+                logger.warning(f"Web channel not available: {e}")
                 
     async def _start_channel(self, name: str, channel: BaseChannel) -> None:
         """Start a channel and log any exceptions."""

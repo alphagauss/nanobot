@@ -345,7 +345,7 @@ def gateway(
     cron.on_job = on_cron_job
     
     # Create channel manager
-    channels = ChannelManager(config, bus)
+    channels = ChannelManager(config, bus, session_manager=session_manager,cron_service=cron,)
 
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
@@ -394,6 +394,9 @@ def gateway(
         interval_s=config.heartbeat.interval_s,
         enabled=True,
     )
+    
+    # Create channel manager
+    channels = ChannelManager(config, bus)
     
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
@@ -696,6 +699,14 @@ def channels_status():
         "Email",
         "✓" if em.enabled else "✗",
         em_config
+    )
+
+    # web server
+    web = config.channels.web
+    table.add_row(
+        "Web",
+        "✓" if web.enabled else "✗",
+        f"{web.host}:{web.port}"
     )
 
     console.print(table)
@@ -1156,6 +1167,29 @@ def _ensure_cleanup_job(cron_service: "CronService", offload_config: "OffloadCon
         deliver=False
     )
 
+
+# ============================================================================
+# TUI Command
+# ============================================================================
+
+
+@app.command()
+def tui(
+    api_url: str = typer.Option("http://localhost:18790", "--api", help="Gateway HTTP API URL"),
+):
+    """Start TUI mode for interactive input (connects to gateway API)."""
+    from tui.app import TUIInput
+    
+    tui_input = TUIInput(gateway_url=api_url)
+    
+    async def run():
+        try:
+            await tui_input.start()
+        except KeyboardInterrupt:
+            pass
+    
+    asyncio.run(run())
+    
 
 if __name__ == "__main__":
     app()

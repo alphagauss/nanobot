@@ -180,6 +180,13 @@ class A2AConfig(BaseModel):
     # Authentication (optional)
     auth_token: str | None = None  # Bearer token for authenticated requests
 
+class WebConfig(BaseModel):
+    """Web backend channel configuration (WebSocket-based)."""
+    enabled: bool = True
+    host: str = "127.0.0.1"
+    port: int = 18790
+    allow_from: list[str] = Field(default_factory=list)
+
 
 class ChannelsConfig(Base):
     """Configuration for chat channels."""
@@ -196,6 +203,7 @@ class ChannelsConfig(Base):
     slack: SlackConfig = Field(default_factory=SlackConfig)
     qq: QQConfig = Field(default_factory=QQConfig)
     a2a: A2AConfig = Field(default_factory=A2AConfig)
+    web: WebConfig = Field(default_factory=WebConfig)
 
 
 class OffloadConfig(Base):
