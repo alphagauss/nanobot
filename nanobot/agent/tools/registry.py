@@ -76,3 +76,7 @@ class ToolRegistry:
     
     def __contains__(self, name: str) -> bool:
         return name in self._tools
+
+    def get_simple_definitions(self) -> list[str]:
+        """Get simple tool definitions in OpenAI format."""
+        return [tool.to_simple_schema() for tool in self._tools.values()]

@@ -24,6 +24,7 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.agent.tools import A2A_TOOL_AVAILABLE
 from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.agent.reasoning import ReasoningEngine, TaskPlan
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
@@ -61,6 +62,9 @@ class AgentLoop:
         temperature: float = 0.1,
         max_tokens: int = 4096,
         memory_window: int = 100,
+        reasoning_enabled: bool = True,
+        reasoning_complexity_min: int = 2,
+        reasoning_verify_always: bool = True,
         brave_api_key: str | None = None,
         offload_config: OffloadConfig | None = None,
         exec_config: ExecToolConfig | None = None,
@@ -80,6 +84,9 @@ class AgentLoop:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.memory_window = memory_window
+        self.reasoning_enabled = reasoning_enabled
+        self.reasoning_complexity_min = reasoning_complexity_min
+        self.reasoning_verify_always = reasoning_verify_always
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
@@ -101,6 +108,7 @@ class AgentLoop:
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
         )
+        self.reasoning = ReasoningEngine(provider=provider, model=self.model)
 
         # Initialize output offloader
         self.offloader = ToolResponseOffloader(workspace, config=offload_config)
@@ -115,6 +123,162 @@ class AgentLoop:
         self._consolidation_locks: dict[str, asyncio.Lock] = {}
         self._register_default_tools()
 
+    def _should_plan(self, content: str, session: Session) -> bool:
+        """Determine whether task planning should be enabled for this request."""
+        if not self.reasoning_enabled:
+            return False
+
+        complexity = 0
+        text = content.strip()
+
+        if len(text) >= 120:
+            complexity += 1
+
+        lowered = text.lower()
+        planning_keywords = ("计划", "分步骤", "先分析", "plan", "step by step")
+        if any(keyword in lowered for keyword in planning_keywords):
+            complexity += 1
+
+        multi_step_markers = ("并且", "然后", "同时", "先", "再", "并行", "and then")
+        marker_hits = sum(1 for marker in multi_step_markers if marker in lowered)
+        if marker_hits >= 2:
+            complexity += 1
+
+        recent_tools_used = [
+            msg.get("tools_used", [])
+            for msg in session.messages[-8:]
+            if isinstance(msg, dict)
+        ]
+        if any(len(used) >= 2 for used in recent_tools_used):
+            complexity += 1
+
+        return complexity >= self.reasoning_complexity_min
+
+    def _should_verify(self, tools_used: list[str], content: str) -> bool:
+        """Determine whether completion verification should run."""
+        if not self.reasoning_enabled:
+            return False
+        if self.reasoning_verify_always:
+            return True
+
+        verify_tools = {"write_file", "edit_file", "spawn"}
+        if any(tool in verify_tools for tool in tools_used):
+            return True
+
+        lowered = content.lower()
+        verify_keywords = ("完成了吗", "验收", "检查", "verify", "double-check")
+        return any(keyword in lowered for keyword in verify_keywords)
+
+    async def _maybe_create_task_plan(
+        self,
+        initial_messages: list[dict[str, Any]],
+        content: str,
+        session: Session,
+        channel: str,
+        chat_id: str,
+    ) -> TaskPlan | None:
+        """Create and inject a task plan when complexity warrants it."""
+        if not self._should_plan(content, session):
+            return None
+
+        task_plan = await self.reasoning.create_plan(
+            messages=initial_messages,
+            task=content,
+            available_tools=self.tools.get_simple_definitions(),
+            context=f"channel={channel}, chat_id={chat_id}",
+        )
+        if task_plan:
+            initial_messages.append({
+                "role": "system",
+                "content": (
+                    "Use this plan as a guide. Adapt if tool outputs prove otherwise.\n\n"
+                    f"{task_plan.to_readable_string()}"
+                ),
+            })
+        return task_plan
+
+    async def _maybe_reflect_step(
+        self,
+        messages: list[dict[str, Any]],
+        task_plan: TaskPlan | None,
+        plan_step_index: int,
+        tools_used_in_step: list[str],
+        step_tool_results: list[str],
+    ) -> int:
+        """Reflect on the current planned step and return the updated step index."""
+        if not task_plan or plan_step_index >= len(task_plan.steps) or not tools_used_in_step:
+            return plan_step_index
+
+        step = task_plan.steps[plan_step_index]
+        expected_tool = (step.tool or "").strip().lower()
+        used_tool_set = {name.strip().lower() for name in tools_used_in_step}
+        if expected_tool not in used_tool_set:
+            return plan_step_index
+
+        reflection = await self.reasoning.reflect_on_step(
+            messages=messages,
+            step=step,
+            actual_tools_used=tools_used_in_step,
+            actual_result="\n".join(step_tool_results),
+        )
+        if reflection.needs_adjustment and reflection.suggested_adjustment:
+            messages.append({
+                "role": "user",
+                "content": f"Plan adjustment hint: {reflection.suggested_adjustment}",
+            })
+        return plan_step_index + 1
+
+    async def _maybe_verify_and_repair(
+        self,
+        initial_messages: list[dict[str, Any]],
+        content: str,
+        final_content: str,
+        tools_used: list[str],
+        stream_callback: Callable[[str], Any] | None,
+        task_plan: TaskPlan | None,
+    ) -> tuple[str, list[str]]:
+        """Verify completion and run one repair pass if needed."""
+        if not self._should_verify(tools_used, content):
+            return final_content, tools_used
+
+        verification = await self.reasoning.verify_completion(
+            messages=initial_messages,
+            original_task=content,
+            plan=task_plan or TaskPlan(
+                goal=content,
+                analysis="No explicit plan generated.",
+                steps=[],
+                success_criteria="Satisfy user request with accurate and complete output.",
+                estimated_iterations=max(1, len(tools_used)),
+            ),
+            final_result=final_content,
+        )
+        if verification.task_completed:
+            return final_content, tools_used
+
+        logger.info("Reasoning verification requested one repair pass")
+        repair_messages = initial_messages + [
+            {"role": "assistant", "content": final_content},
+            {
+                "role": "user",
+                "content": (
+                    "The previous result is incomplete. Fix it now.\n"
+                    f"Missing items: {verification.missing_items}\n"
+                    f"Issues: {verification.issues}\n"
+                    "Return the corrected final answer."
+                ),
+            },
+        ]
+        retry_content, retry_tools_used = await self._run_agent_loop(
+            repair_messages,
+            stream_callback,
+            task_plan=task_plan,
+        )
+        if retry_content:
+            final_content = retry_content
+        tools_used.extend(retry_tools_used)
+        return final_content, tools_used
+    
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         allowed_dir = self.workspace if self.restrict_to_workspace else None
@@ -201,8 +365,9 @@ class AgentLoop:
 
     async def _run_agent_loop(
         self,
-        initial_messages: list[dict], 
+        initial_messages: list[dict],
         stream_callback: Callable[[str], Any] | None = None,
+        task_plan: TaskPlan | None = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
@@ -210,6 +375,7 @@ class AgentLoop:
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        plan_step_index = 0
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -281,8 +447,11 @@ class AgentLoop:
                     reasoning_content=response.reasoning_content,
                 )
 
+                tools_used_in_step: list[str] = []
+                step_tool_results: list[str] = []
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
+                    tools_used_in_step.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
@@ -303,6 +472,16 @@ class AgentLoop:
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+                    step_tool_results.append(result)
+
+                plan_step_index = await self._maybe_reflect_step(
+                    messages=messages,
+                    task_plan=task_plan,
+                    plan_step_index=plan_step_index,
+                    tools_used_in_step=tools_used_in_step,
+                    step_tool_results=step_tool_results,
+                )
+                messages.append({"role": "user", "content": "Reflect on the results and decide next steps."})
             else:
                 final_content = self._strip_think(response.content)
                 break
@@ -486,7 +665,8 @@ class AgentLoop:
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
-            channel=msg.channel, chat_id=msg.chat_id,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -497,15 +677,25 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
+        final_content, tools_used, all_msgs = await self._run_agent_loop(
             initial_messages, 
             stream_callback,
+            task_plan=task_plan,
             on_progress=on_progress or _bus_progress,
             )
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 
+        final_content, tools_used = await self._maybe_verify_and_repair(
+            initial_messages=initial_messages,
+            content=msg.content,
+            final_content=final_content,
+            tools_used=tools_used,
+            stream_callback=stream_callback,
+            task_plan=task_plan,
+        )
+        
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
