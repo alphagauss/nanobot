@@ -16,6 +16,7 @@ class InboundMessage:
     timestamp: datetime = field(default_factory=datetime.now)
     media: list[str] = field(default_factory=list)  # Media URLs
     metadata: dict[str, Any] = field(default_factory=dict)  # Channel-specific data
+    stream_id: str | None = None  # Optional ID for streaming callback lookup
     
     @property
     def session_key(self) -> str:

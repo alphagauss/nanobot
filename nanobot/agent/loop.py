@@ -1,6 +1,7 @@
 """Agent loop: the core processing engine."""
 
 import asyncio
+from collections.abc import Callable
 from contextlib import AsyncExitStack
 import json
 import json_repair
@@ -12,7 +13,7 @@ from loguru import logger
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.providers.base import LLMProvider
+from nanobot.providers.base import LLMProvider, LLMResponse
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
@@ -192,7 +193,8 @@ class AgentLoop:
 
     async def _run_agent_loop(
         self,
-        initial_messages: list[dict],
+        initial_messages: list[dict], 
+        stream_callback: Callable[[str], Any] | None = None,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> tuple[str | None, list[str]]:
         """
@@ -213,18 +215,54 @@ class AgentLoop:
         while iteration < self.max_iterations:
             iteration += 1
 
-            response = await self.provider.chat(
-                messages=messages,
-                tools=self.tools.get_definitions(),
-                model=self.model,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-            )
+            if stream_callback:
+                # Use streaming provider
+                full_content = ""
+                full_reasoning = ""
+                tool_calls: list = []
 
+                async for chunk in self.provider.stream(
+                    messages=messages,
+                    tools=self.tools.get_definitions(),
+                    model=self.model,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                ):
+                    if chunk.content:
+                        full_content += chunk.content
+                        if not chunk.tool_calls:
+                            res = stream_callback(chunk.content)
+                            if asyncio.iscoroutine(res):
+                                await res
+                    if chunk.reasoning_content:
+                        full_reasoning += chunk.reasoning_content
+                    if chunk.tool_calls:
+                        tool_calls.extend(chunk.tool_calls)
+
+                response = LLMResponse(
+                    content=full_content if full_content else None,
+                    reasoning_content=full_reasoning if full_reasoning else None,
+                    tool_calls=tool_calls,
+                )
+            
+            else: 
+                # Call LLM normally
+
+                response = await self.provider.chat(
+                    messages=messages,
+                    tools=self.tools.get_definitions(),
+                    model=self.model,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                )
+
+            # Handle tool calls
             if response.has_tool_calls:
                 if on_progress:
                     clean = self._strip_think(response.content)
                     await on_progress(clean or self._tool_hint(response.tool_calls))
+                if stream_callback:
+                    await stream_callback(self._tool_hint(response.tool_calls))
 
                 tool_call_dicts = [
                     {
@@ -246,7 +284,15 @@ class AgentLoop:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
+
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+
+                    # 执行工具流式反馈
+                    if stream_callback:
+                        section = str(result)[:30].replace("\n", "")
+                        res = stream_callback(f"【执行工具】：{tool_call.name}({args_str}) -> {section}...\n")
+                        if asyncio.iscoroutine(res):
+                            await res
 
                     if self.offloader.should_offload(tool_call.name, result):
                         offload_res = self.offloader.offload(tool_call.name, result)
@@ -274,8 +320,14 @@ class AgentLoop:
                     self.bus.consume_inbound(),
                     timeout=1.0
                 )
+
+                # Check for streaming callback
+                stream_callback = None
+                if msg.stream_id:
+                    stream_callback = self.bus.get_stream_callback(msg.stream_id)
+
                 try:
-                    response = await self._process_message(msg)
+                    response = await self._process_message(msg, stream_callback=stream_callback)
                     if response:
                         await self.bus.publish_outbound(response)
                 except Exception as e:
@@ -305,6 +357,7 @@ class AgentLoop:
     async def _process_message(
         self,
         msg: InboundMessage,
+        stream_callback: Callable[[str], Any] | None = None, 
         session_key: str | None = None,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
@@ -313,6 +366,7 @@ class AgentLoop:
         
         Args:
             msg: The inbound message to process.
+            stream_callback: Optional callback for streaming content chunks.
             session_key: Override session key (used by process_direct).
             on_progress: Optional callback for intermediate output (defaults to bus publish).
         
@@ -369,8 +423,10 @@ class AgentLoop:
             ))
 
         final_content, tools_used = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
-        )
+            initial_messages, 
+            stream_callback,
+            on_progress=on_progress or _bus_progress,
+            )
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
@@ -383,6 +439,15 @@ class AgentLoop:
                             tools_used=tools_used if tools_used else None)
         self.sessions.save(session)
 
+        # Mark stream as done so channel can close streaming session
+        if msg.stream_id:
+            self.bus.mark_stream_done(msg.stream_id)
+
+        # If streaming was used, content was already delivered via callback
+        # Return None to skip sending a duplicate OutboundMessage
+        if stream_callback:
+            return None
+        
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
@@ -525,6 +590,7 @@ Respond with ONLY valid JSON, no markdown fences."""
         channel: str = "cli",
         chat_id: str = "direct",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        stream_callback: Callable[[str], Any] | None = None,
     ) -> str:
         """
         Process a message directly (for CLI or cron usage).
@@ -535,6 +601,7 @@ Respond with ONLY valid JSON, no markdown fences."""
             channel: Source channel (for tool context routing).
             chat_id: Source chat ID (for tool context routing).
             on_progress: Optional callback for intermediate output.
+            stream_callback: Optional callback for streaming content chunks.
         
         Returns:
             The agent's response.
@@ -547,5 +614,5 @@ Respond with ONLY valid JSON, no markdown fences."""
             content=content
         )
         
-        response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
+        response = await self._process_message(msg, stream_callback=stream_callback, session_key=session_key, on_progress=on_progress)
         return response.content if response else ""

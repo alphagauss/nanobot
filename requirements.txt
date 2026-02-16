@@ -17,3 +17,4 @@ tiktoken
 prompt-toolkit>=3.0.0
 python-socks[asyncio]
 a2a-sdk[http-server]>=0.2.0
+json-repair>=0.30.0
