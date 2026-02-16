@@ -3,6 +3,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
+from collections.abc import AsyncIterator
 
 
 @dataclass
@@ -103,8 +104,36 @@ class LLMProvider(ABC):
             LLMResponse with content and/or tool calls.
         """
         pass
-    
+
+    @abstractmethod
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+    ) -> AsyncIterator["LLMResponse"]:
+        """
+        Send a chat completion request and stream the response.
+
+        Args:
+            messages: List of message dicts with 'role' and 'content'.
+            tools: Optional list of tool definitions.
+            model: Model identifier (provider-specific).
+            max_tokens: Maximum tokens in response.
+            temperature: Sampling temperature.
+
+        Yields:
+            Partial LLMResponse chunks with content or tool calls.
+        """
+        pass
+        # Make this an async generator
+        yield  # type: ignore
+
+
     @abstractmethod
     def get_default_model(self) -> str:
         """Get the default model for this provider."""
         pass
+

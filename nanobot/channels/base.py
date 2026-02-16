@@ -91,6 +91,7 @@ class BaseChannel(ABC):
         media: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         session_key: str | None = None,
+        stream_id: str | None = None  # Optional ID for streaming callback lookup
     ) -> None:
         """
         Handle an incoming message from the chat platform.
@@ -121,6 +122,7 @@ class BaseChannel(ABC):
             media=media or [],
             metadata=metadata or {},
             session_key_override=session_key,
+            stream_id=stream_id
         )
         
         await self.bus.publish_inbound(msg)

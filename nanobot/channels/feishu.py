@@ -11,14 +11,24 @@ from typing import Any
 from pathlib import Path
 import httpx
 from loguru import logger
+import time
+import uuid
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import FeishuConfig
 
 try:
     import lark_oapi as lark
+    from lark_oapi.api.cardkit.v1 import (
+        ContentCardElementRequest,
+        ContentCardElementRequestBody,
+        CreateCardRequest,
+        CreateCardRequestBody,
+        SettingsCardRequest,
+        SettingsCardRequestBody,
+    )
     from lark_oapi.api.im.v1 import (
         CreateFileRequest,
         CreateFileRequestBody,
@@ -34,8 +44,10 @@ try:
         P2ImMessageReceiveV1,
     )
     FEISHU_AVAILABLE = True
+    CARDKIT_AVAILABLE = True
 except ImportError:
     FEISHU_AVAILABLE = False
+    CARDKIT_AVAILABLE = False
     lark = None
     Emoji = None
 
@@ -649,7 +661,7 @@ class FeishuChannel(BaseChannel):
             asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
     
     async def _on_message(self, data: "P2ImMessageReceiveV1") -> None:
-        """Handle incoming message from Feishu."""
+        """Handle incoming message from Feishu with streaming support."""
         try:
             event = data.event
             message = event.message
@@ -718,6 +730,46 @@ class FeishuChannel(BaseChannel):
 
             # Forward to message bus
             reply_to = chat_id if chat_type == "group" else sender_id
+
+            receive_id_type = "chat_id" if reply_to.startswith("oc_") else "open_id"
+
+            # Try to create streaming session
+            stream_id = str(uuid.uuid4())
+            streaming_session: FeishuStreamingSession | None = None
+            use_streaming = False
+            loop = asyncio.get_running_loop()
+
+            # Check if streaming is enabled in config and CardKit is available
+            if self.config.streaming and CARDKIT_AVAILABLE:
+                streaming_session = FeishuStreamingSession(
+                    client=self._client, chat_id=reply_to, receive_id_type=receive_id_type
+                )
+                use_streaming = await loop.run_in_executor(None, streaming_session.start_sync)
+                if not use_streaming:
+                    streaming_session = None
+
+            if use_streaming and streaming_session:
+                # Accumulated text for updates
+                accumulated_text = ""
+                accumulated_lock = threading.Lock()
+
+                def stream_callback(chunk: str) -> None:
+                    """Callback invoked for each streaming chunk (non-blocking)."""
+                    nonlocal accumulated_text
+                    with accumulated_lock:
+                        accumulated_text += chunk
+                        text_snapshot = accumulated_text
+                    # Submit update to thread pool (fire-and-forget)
+                    try:
+                        loop.run_in_executor(None, streaming_session.update_sync, text_snapshot)
+                    except RuntimeError:
+                        # Loop might be closed
+                        pass
+
+                # Register callback with bus
+                self.bus.register_stream_callback(stream_id, stream_callback)
+
+            # Create and publish inbound message
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=reply_to,
@@ -727,8 +779,369 @@ class FeishuChannel(BaseChannel):
                     "message_id": message_id,
                     "chat_type": chat_type,
                     "msg_type": msg_type,
-                }
+                },
+                stream_id=stream_id if use_streaming else None,
             )
+
+            # Wait for response and close streaming session if active
+            if use_streaming and streaming_session:
+                await self._wait_and_close_stream(streaming_session, stream_id)
 
         except Exception as e:
             logger.error(f"Error processing Feishu message: {e}")
+
+    async def _wait_and_close_stream(
+        self, session: "FeishuStreamingSession", stream_id: str
+    ) -> None:
+        """Wait for agent loop to finish, then close streaming session."""
+        loop = asyncio.get_running_loop()
+
+        # Wait for agent loop to signal completion (via bus.mark_stream_done)
+        await self.bus.wait_stream_done(stream_id, timeout=300)
+
+        if not session.closed:
+            await loop.run_in_executor(
+                None, session.close_sync, session.pending_text or session.current_text
+            )
+
+    async def _download_media(self, message_id: str, file_key: str, media_type: str) -> str | None:
+        """
+        Download media file from Feishu and save to local disk.
+
+        Args:
+            message_id: Message ID
+            file_key: File key (image_key or file_key)
+            media_type: Media type (image/audio/file)
+
+        Returns:
+            Local file path, or None if download failed
+        """
+        try:
+            # Get file extension
+            ext = self._get_extension(media_type)
+
+            # Create media directory
+            from nanobot.utils.helpers import get_data_path
+            media_dir = get_data_path() / "media"
+            media_dir.mkdir(parents=True, exist_ok=True)
+
+            # Generate file path
+            file_path = media_dir / f"{file_key[:16]}{ext}"
+
+            # Fetch file content from Feishu API
+            file_content = await self._fetch_file_content(message_id, file_key, media_type)
+
+            if not file_content:
+                logger.warning(f"Failed to fetch {media_type} content: {file_key}")
+                return None
+
+            # Save to file
+            file_path.write_bytes(file_content)
+
+            logger.info(f"Downloaded {media_type} to {file_path}")
+            return str(file_path)
+
+        except Exception as e:
+            logger.error(f"Failed to download {media_type}: {e}")
+            return None
+
+    async def _fetch_file_content(self, message_id: str, file_key: str, media_type: str) -> bytes | None:
+        """
+        Fetch file content from Feishu API.
+
+        Uses message resource API to get file content directly.
+
+        Returns:
+            File content as bytes, or None if failed
+        """
+        try:
+            # Get tenant access token via HTTP API
+            token_url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+            token_payload = {
+                "app_id": self.config.app_id,
+                "app_secret": self.config.app_secret
+            }
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                token_response = await client.post(token_url, json=token_payload)
+
+                if token_response.status_code != 200:
+                    logger.error(f"Failed to get access token: status {token_response.status_code}")
+                    return None
+
+                token_data = token_response.json()
+                if token_data.get("code") != 0:
+                    logger.error(f"Failed to get access token: {token_data.get('msg')}")
+                    return None
+
+                access_token = token_data.get("tenant_access_token")
+                logger.debug(f"Got access token: {access_token[:20]}...")
+
+                # Use message resource API to get file content
+                # Reference: https://open.feishu.cn/document/server-docs/im-v1/message-resource/get
+                api_url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{file_key}"
+
+                # Make request to get file
+                response = await client.get(
+                    api_url,
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                    },
+                    params={"type": media_type}
+                )
+
+                logger.debug(f"Fetch file response: status={response.status_code}")
+                logger.debug(f"Response headers: {dict(response.headers)}")
+                logger.debug(f"Response content-type: {response.headers.get('Content-Type', 'unknown')}")
+
+                if response.status_code != 200:
+                    logger.warning(f"HTTP error: status={response.status_code}, response={response.text[:500]}")
+                    return None
+
+                # Check if response is JSON (might contain download_url or file data)
+                content_type = response.headers.get("Content-Type", "")
+
+                if "application/json" in content_type:
+                    try:
+                        data = response.json()
+                        logger.debug(f"JSON response: {json.dumps(data, ensure_ascii=False)}")
+
+                        if data.get("code") == 0:
+                            # Check if response contains download_url
+                            download_url = data.get("data", {}).get("file", {}).get("download_url")
+                            if download_url:
+                                # Download from the URL
+                                logger.info(f"Got download URL, fetching from: {download_url}")
+                                file_resp = await client.get(download_url)
+                                file_resp.raise_for_status()
+                                return file_resp.content
+
+                            # Check if response contains file content (base64 or other format)
+                            file_data = data.get("data", {}).get("file", {}).get("content")
+                            if file_data:
+                                import base64
+                                return base64.b64decode(file_data)
+
+                            logger.error(f"JSON response doesn't contain file content or download_url")
+                        else:
+                            logger.error(f"API error: code={data.get('code')}, msg={data.get('msg')}")
+                        return None
+                    except Exception as json_err:
+                        logger.error(f"Failed to parse JSON response: {json_err}")
+                        logger.error(f"Response was: {response.text[:1000]}")
+                        return None
+
+                # Response is binary file content directly
+                logger.info(f"Got binary file content, size: {len(response.content)} bytes")
+                return response.content
+
+        except Exception as e:
+            logger.error(f"Error fetching file content: {e}")
+            return None
+
+    def _get_extension(self, media_type: str) -> str:
+        """Get file extension based on media type."""
+        ext_map = {
+            "image": ".jpg",
+            "audio": ".m4a",
+            "file": "",
+            "video": ".mp4",
+        }
+        return ext_map.get(media_type, "")
+
+
+class FeishuStreamingSession:
+    """Manages a streaming card session using CardKit streaming API."""
+
+    ELEMENT_ID = "streaming_content"  # Fixed element ID for streaming updates
+
+    def __init__(self, client: Any, chat_id: str, receive_id_type: str):
+        self.client = client
+        self.chat_id = chat_id
+        self.receive_id_type = receive_id_type
+        self.card_id: str | None = None
+        self.current_text = ""
+        self.closed = False
+        self.last_update_time = 0.0
+        self.pending_text: str | None = None
+        self._sequence = 0
+        self._lock = threading.Lock()
+
+    def _build_streaming_card_json(self, initial_text: str = "Thinking...") -> str:
+        """Build Card JSON 2.0 with streaming mode enabled (no header for better preview)."""
+        card = {
+            "schema": "2.0",
+            "config": {
+                "streaming_mode": True,
+                "summary": {"content": "[生成中...]"},
+                "streaming_config": {
+                    "print_frequency_ms": {"default": 50},
+                    "print_step": {"default": 2},
+                    "print_strategy": "fast",
+                },
+            },
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": initial_text,
+                        "element_id": self.ELEMENT_ID,
+                    }
+                ]
+            },
+        }
+        return json.dumps(card, ensure_ascii=False)
+
+    def start_sync(self) -> bool:
+        """Create card entity and send it (sync)."""
+        if self.card_id:
+            return True
+
+        if not CARDKIT_AVAILABLE:
+            logger.warning("CardKit API not available, falling back to simple mode")
+            return False
+
+        try:
+            # Step 1: Create card entity with streaming mode
+            card_json = self._build_streaming_card_json()
+            create_request = (
+                CreateCardRequest.builder()
+                .request_body(
+                    CreateCardRequestBody.builder().type("card_json").data(card_json).build()
+                )
+                .build()
+            )
+
+            create_response = self.client.cardkit.v1.card.create(create_request)
+            if not create_response.success():
+                logger.error(
+                    f"Failed to create card entity: code={create_response.code}, "
+                    f"msg={create_response.msg}. "
+                    "Check if app has 'cardkit:card:write' permission."
+                )
+                return False
+
+            self.card_id = create_response.data.card_id
+
+            # Step 2: Send card entity as message
+            msg_content = json.dumps(
+                {"type": "card", "data": {"card_id": self.card_id}}, ensure_ascii=False
+            )
+            send_request = (
+                CreateMessageRequest.builder()
+                .receive_id_type(self.receive_id_type)
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(self.chat_id)
+                    .msg_type("interactive")
+                    .content(msg_content)
+                    .build()
+                )
+                .build()
+            )
+
+            send_response = self.client.im.v1.message.create(send_request)
+            if not send_response.success():
+                logger.error(f"Failed to send card: {send_response.msg}")
+                return False
+            return True
+
+        except Exception as e:
+            logger.error(f"Error starting streaming session: {e}")
+            return False
+
+    def update_sync(self, text: str) -> bool:
+        """Stream update text content using CardKit API (sync, with throttling)."""
+        if self.closed or not self.card_id:
+            return False
+
+        with self._lock:
+            now = time.time() * 1000
+            # Throttle: max 10 requests/sec (100ms interval)
+            if now - self.last_update_time < 100:
+                self.pending_text = text  # Save for later
+                return True  # Skip this update, will catch up
+
+            self.pending_text = text
+            self._sequence += 1
+            seq = self._sequence
+            self.current_text = text
+            self.last_update_time = now
+
+        try:
+            # Use CardKit streaming content API
+            # Each request needs a unique UUID for idempotency
+            request = (
+                ContentCardElementRequest.builder()
+                .card_id(self.card_id)
+                .element_id(self.ELEMENT_ID)
+                .request_body(
+                    ContentCardElementRequestBody.builder()
+                    .content(text)
+                    .uuid(str(uuid.uuid4()))  # New UUID for each request
+                    .sequence(seq)
+                    .build()
+                )
+                .build()
+            )
+
+            response = self.client.cardkit.v1.card_element.content(request)
+            return response.success()
+        except Exception:
+            return False
+
+    def close_sync(self, final_text: str | None = None) -> bool:
+        """Close streaming mode and finalize card (sync)."""
+        if self.closed:
+            return True
+        self.closed = True
+
+        if not self.card_id:
+            return False
+
+        text = final_text or self.pending_text or self.current_text or "Done."
+
+        try:
+            # Final content update
+            with self._lock:
+                self._sequence += 1
+                seq = self._sequence
+
+            content_request = (
+                ContentCardElementRequest.builder()
+                .card_id(self.card_id)
+                .element_id(self.ELEMENT_ID)
+                .request_body(
+                    ContentCardElementRequestBody.builder()
+                    .content(text)
+                    .uuid(str(uuid.uuid4()))
+                    .sequence(seq)
+                    .build()
+                )
+                .build()
+            )
+            self.client.cardkit.v1.card_element.content(content_request)
+
+            # Close streaming mode and clear summary (removes "[生成中...]")
+            settings = {"config": {"streaming_mode": False, "summary": {"content": ""}}}
+            settings_request = (
+                SettingsCardRequest.builder()
+                .card_id(self.card_id)
+                .request_body(
+                    SettingsCardRequestBody.builder()
+                    .settings(json.dumps(settings, ensure_ascii=False))
+                    .uuid(str(uuid.uuid4()))
+                    .sequence(seq + 1)
+                    .build()
+                )
+                .build()
+            )
+
+            resp = self.client.cardkit.v1.card.settings(settings_request)
+            if not resp.success():
+                logger.warning(f"Failed to close streaming: {resp.code} {resp.msg}")
+            return resp.success()
+        except Exception as e:
+            logger.error(f"Error closing streaming session: {e}")
+            return False
+        

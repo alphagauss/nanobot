@@ -499,9 +499,18 @@ def agent(
     if message:
         # Single message mode — direct call, no bus needed
         async def run_once():
-            with _thinking_ctx():
-                response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
-            _print_agent_response(response, render_markdown=markdown)
+            # with _thinking_ctx():
+            #     response = await agent_loop.process_direct(message, session_id)
+            # _print_agent_response(response, render_markdown=markdown)
+
+            console.print(f"\n{__logo__} ", end="")
+            await agent_loop.process_direct(
+                message,
+                session_id,
+                stream_callback=lambda chunk: console.print(chunk, end=""),
+            )
+            console.print()
+
             await agent_loop.close_mcp()
 
         asyncio.run(run_once())

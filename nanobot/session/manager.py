@@ -96,7 +96,12 @@ class SessionManager:
         if key in self._cache:
             return self._cache[key]
         
-        session = self._load(key)
+        # 修改：在命令行下不加载历史记录（因为主要用来测试）
+        if key == "cli:direct":
+            session = None
+        else:
+            session = self._load(key)
+            
         if session is None:
             session = Session(key=key)
         

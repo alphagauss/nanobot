@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections.abc import Callable
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -200,7 +201,8 @@ class AgentLoop:
 
     async def _run_agent_loop(
         self,
-        initial_messages: list[dict],
+        initial_messages: list[dict], 
+        stream_callback: Callable[[str], Any] | None = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
@@ -212,20 +214,56 @@ class AgentLoop:
         while iteration < self.max_iterations:
             iteration += 1
 
-            response = await self.provider.chat(
-                messages=messages,
-                tools=self.tools.get_definitions(),
-                model=self.model,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-            )
+            if stream_callback:
+                # Use streaming provider
+                full_content = ""
+                full_reasoning = ""
+                tool_calls: list = []
 
+                async for chunk in self.provider.stream(
+                    messages=messages,
+                    tools=self.tools.get_definitions(),
+                    model=self.model,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                ):
+                    if chunk.content:
+                        full_content += chunk.content
+                        if not chunk.tool_calls:
+                            res = stream_callback(chunk.content)
+                            if asyncio.iscoroutine(res):
+                                await res
+                    if chunk.reasoning_content:
+                        full_reasoning += chunk.reasoning_content
+                    if chunk.tool_calls:
+                        tool_calls.extend(chunk.tool_calls)
+
+                response = LLMResponse(
+                    content=full_content if full_content else None,
+                    reasoning_content=full_reasoning if full_reasoning else None,
+                    tool_calls=tool_calls,
+                )
+            
+            else: 
+                # Call LLM normally
+
+                response = await self.provider.chat(
+                    messages=messages,
+                    tools=self.tools.get_definitions(),
+                    model=self.model,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                )
+
+            # Handle tool calls
             if response.has_tool_calls:
                 if on_progress:
                     clean = self._strip_think(response.content)
                     if clean:
                         await on_progress(clean)
                     await on_progress(self._tool_hint(response.tool_calls), tool_hint=True)
+                if stream_callback:
+                    await stream_callback(self._tool_hint(response.tool_calls))
 
                 tool_call_dicts = [
                     {
@@ -248,6 +286,13 @@ class AgentLoop:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+
+                    # 执行工具流式反馈
+                    if stream_callback:
+                        section = str(result)[:30].replace("\n", "")
+                        res = stream_callback(f"【执行工具】：{tool_call.name}({args_str}) -> {section}...\n")
+                        if asyncio.iscoroutine(res):
+                            await res
 
                     if self.offloader.should_offload(tool_call.name, result):
                         offload_res = self.offloader.offload(tool_call.name, result)
@@ -283,9 +328,15 @@ class AgentLoop:
                     self.bus.consume_inbound(),
                     timeout=1.0
                 )
+
+                # Check for streaming callback
+                stream_callback = None
+                if msg.stream_id:
+                    stream_callback = self.bus.get_stream_callback(msg.stream_id)
+
                 try:
-                    response = await self._process_message(msg)
-                    if response is not None:
+                    response = await self._process_message(msg, stream_callback=stream_callback)
+                    if response:
                         await self.bus.publish_outbound(response)
                     elif msg.channel == "cli":
                         await self.bus.publish_outbound(OutboundMessage(
@@ -330,11 +381,23 @@ class AgentLoop:
     async def _process_message(
         self,
         msg: InboundMessage,
+        stream_callback: Callable[[str], Any] | None = None, 
         session_key: str | None = None,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
-        """Process a single inbound message and return the response."""
-        # System messages: parse origin from chat_id ("channel:chat_id")
+        """
+        Process a single inbound message.
+        
+        Args:
+            msg: The inbound message to process.
+            stream_callback: Optional callback for streaming content chunks.
+            session_key: Override session key (used by process_direct).
+            on_progress: Optional callback for intermediate output (defaults to bus publish).
+        
+        Returns:
+            The response message, or None if no response needed.
+        """
+        # System messages route back via chat_id ("channel:chat_id")
         if msg.channel == "system":
             channel, chat_id = (msg.chat_id.split(":", 1) if ":" in msg.chat_id
                                 else ("cli", msg.chat_id))
@@ -435,8 +498,10 @@ class AgentLoop:
             ))
 
         final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
-        )
+            initial_messages, 
+            stream_callback,
+            on_progress=on_progress or _bus_progress,
+            )
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
@@ -447,6 +512,15 @@ class AgentLoop:
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
 
+        # Mark stream as done so channel can close streaming session
+        if msg.stream_id:
+            self.bus.mark_stream_done(msg.stream_id)
+
+        # If streaming was used, content was already delivered via callback
+        # Return None to skip sending a duplicate OutboundMessage
+        if stream_callback:
+            return None
+        
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
                 return None
@@ -485,9 +559,23 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        stream_callback: Callable[[str], Any] | None = None,
     ) -> str:
-        """Process a message directly (for CLI or cron usage)."""
+        """
+        Process a message directly (for CLI or cron usage).
+        
+        Args:
+            content: The message content.
+            session_key: Session identifier (overrides channel:chat_id for session lookup).
+            channel: Source channel (for tool context routing).
+            chat_id: Source chat ID (for tool context routing).
+            on_progress: Optional callback for intermediate output.
+            stream_callback: Optional callback for streaming content chunks.
+        
+        Returns:
+            The agent's response.
+        """
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
-        response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
+        response = await self._process_message(msg, stream_callback=stream_callback, session_key=session_key, on_progress=on_progress)
         return response.content if response else ""
