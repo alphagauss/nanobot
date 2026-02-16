@@ -223,10 +223,10 @@ class OffloadConfig(Base):
 class OffloadConfig(BaseModel):
     """Tool response offloading configuration."""
     enabled: bool = True
-    threshold_tokens: int = 500
-    threshold_bytes: int = 2000
-    max_preview_tokens: int = 150
-    max_preview_lines: int = 10
+    threshold_tokens: int = 10000
+    threshold_bytes: int = 50000
+    max_preview_tokens: int = 3000
+    max_preview_lines: int = 100
     storage_dir: str = ".artifacts"
     retention_days: int = 7
     include_metadata: bool = True
