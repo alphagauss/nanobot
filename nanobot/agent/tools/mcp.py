@@ -2,6 +2,7 @@
 
 import asyncio
 from contextlib import AsyncExitStack
+import os
 from typing import Any
 
 import httpx
@@ -9,6 +10,7 @@ from loguru import logger
 
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.config.schema import MCPServerConfig
 
 
 class MCPToolWrapper(Tool):
@@ -54,35 +56,43 @@ class MCPToolWrapper(Tool):
 
 
 async def connect_mcp_servers(
-    mcp_servers: dict, registry: ToolRegistry, stack: AsyncExitStack
+    mcp_servers: dict[str, MCPServerConfig], registry: ToolRegistry, stack: AsyncExitStack
 ) -> None:
     """Connect to configured MCP servers and register their tools."""
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
+    from mcp.client.streamable_http import streamable_http_client
+    from mcp.client.sse import sse_client
 
     for name, cfg in mcp_servers.items():
         try:
-            if cfg.command:
+            if cfg.transport == "stdio":
+                if not cfg.command:
+                    logger.warning(f"MCP '{name}': missing command, skipping")
+                    continue
+
+                env = {**os.environ, **cfg.env} if cfg.env else None
                 params = StdioServerParameters(
-                    command=cfg.command, args=cfg.args, env=cfg.env or None
+                    command=cfg.command, args=cfg.args, env=env
                 )
                 read, write = await stack.enter_async_context(stdio_client(params))
-            elif cfg.url:
-                from mcp.client.streamable_http import streamable_http_client
-                if cfg.headers:
-                    http_client = await stack.enter_async_context(
-                        httpx.AsyncClient(
-                            headers=cfg.headers,
-                            follow_redirects=True
-                        )
-                    )
-                    read, write, _ = await stack.enter_async_context(
-                        streamable_http_client(cfg.url, http_client=http_client)
-                    )
-                else:
-                    read, write, _ = await stack.enter_async_context(
-                        streamable_http_client(cfg.url)
-                    )
+
+            elif cfg.transport == "streamable-http":
+                if not cfg.url:
+                    logger.warning(f"MCP '{name}': missing url, skipping")   
+                    continue
+
+                read, write, _ = await stack.enter_async_context(
+                    streamable_http_client(cfg.url)
+                )
+            elif cfg.transport == "sse":
+                if not cfg.url:
+                    logger.warning(f"MCP '{name}': missing url, skipping")   
+                    continue
+                         
+                read, write, _ = await stack.enter_async_context(
+                    sse_client(cfg.url)
+                )
             else:
                 logger.warning("MCP server '{}': no command or url configured, skipping", name)
                 continue

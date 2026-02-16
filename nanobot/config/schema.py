@@ -1,6 +1,7 @@
 """Configuration schema using Pydantic."""
 
 from pathlib import Path
+from typing import Literal
 from pydantic import BaseModel, Field, ConfigDict
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
@@ -309,13 +310,18 @@ class ExecToolConfig(Base):
 
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
+    transport: Literal["stdio", "sse", "streamable-http"] = "stdio"
 
+    # stdio fields
     command: str = ""  # Stdio: command to run (e.g. "npx")
     args: list[str] = Field(default_factory=list)  # Stdio: command arguments
     env: dict[str, str] = Field(default_factory=dict)  # Stdio: extra env vars
+
+    # sse / streamable-http fields
     url: str = ""  # HTTP: streamable HTTP endpoint URL
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP: Custom HTTP Headers
     tool_timeout: int = 30  # Seconds before a tool call is cancelled
+    headers: dict[str, str] = Field(default_factory=dict)
 
 
 class ToolsConfig(Base):
