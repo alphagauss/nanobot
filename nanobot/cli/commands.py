@@ -387,6 +387,9 @@ def gateway(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
+        reasoning_enabled = config.agents.defaults.reasoning_enabled,
+        reasoning_complexity_min = config.agents.defaults.reasoning_complexity_min,
+        reasoning_verify_always = config.agents.defaults.reasoning_verify_always,        
     )
     
     # Set cron callback (needs agent)
@@ -499,6 +502,8 @@ def agent(
         provider=provider,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
+        temperature=config.agents.defaults.temperature,
+        max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
         brave_api_key=config.tools.web.search.api_key or None,
@@ -507,6 +512,9 @@ def agent(
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
+        reasoning_enabled = config.agents.defaults.reasoning_enabled,
+        reasoning_complexity_min = config.agents.defaults.reasoning_complexity_min,
+        reasoning_verify_always = config.agents.defaults.reasoning_verify_always,   
     )
     
     # Show spinner when logs are off (no output to miss); skip when logs are on

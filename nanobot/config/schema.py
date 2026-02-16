@@ -238,7 +238,9 @@ class AgentDefaults(Base):
     temperature: float = 0.7
     max_tool_iterations: int = 20
     memory_window: int = 50
-
+    reasoning_enabled: bool = True
+    reasoning_complexity_min: int = 2
+    reasoning_verify_always: bool = True
 
 class AgentsConfig(Base):
     """Agent configuration."""
