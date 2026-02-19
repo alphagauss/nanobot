@@ -6,7 +6,7 @@ import os
 from typing import Any
 from collections.abc import AsyncIterator
 import litellm
-from litellm import acompletion
+from litellm import ModelResponse, acompletion
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.providers.registry import find_by_model, find_gateway
@@ -326,7 +326,7 @@ class LiteLLMProvider(LLMProvider):
             )
 
 
-    def _parse_response(self, response: Any) -> LLMResponse:
+    def _parse_response(self, response: ModelResponse) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""
         choice = response.choices[0]
         message = choice.message
@@ -366,3 +366,76 @@ class LiteLLMProvider(LLMProvider):
     def get_default_model(self) -> str:
         """Get the default model."""
         return self.default_model
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    OPENCODE_ZEN_BASE = "https://opencode.ai/zen/v1"
+    TEST_MODEL = "glm-5-free"
+
+    test_msgs_plain = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "你是谁?"},
+    ]
+    test_msgs_tool = [
+        {"role": "system", "content": "You are a helpful assistant. Use tools when needed."},
+        {"role": "user", "content": "请告诉我北京时间，并调用工具。"},
+    ]
+    test_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_current_time",
+                "description": "Get current time in a specific timezone.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "timezone": {"type": "string", "description": "IANA timezone, e.g. Asia/Shanghai"}
+                    },
+                    "required": ["timezone"],
+                },
+            },
+        }
+    ]
+
+    async def run_chat_test() -> None:
+        provider = LiteLLMProvider(api_key="", api_base=OPENCODE_ZEN_BASE, default_model=TEST_MODEL)
+        print("\n=== LiteLLMProvider chat: plain ===")
+        plain = await provider.chat(test_msgs_plain)
+        print("Content:", plain.content)
+        print("Tool Calls:", plain.tool_calls)
+        print("Finish Reason:", plain.finish_reason)
+        print("Usage:", plain.usage)
+
+        print("\n=== LiteLLMProvider chat: with tool ===")
+        with_tool = await provider.chat(test_msgs_tool, tools=test_tools)
+        print("Content:", with_tool.content)
+        print("Tool Calls:", with_tool.tool_calls)
+        print("Finish Reason:", with_tool.finish_reason)
+        print("Usage:", with_tool.usage)
+
+    async def run_stream_test() -> None:
+        provider = LiteLLMProvider(api_key="", api_base=OPENCODE_ZEN_BASE, default_model=TEST_MODEL)
+        print("\n=== LiteLLMProvider stream: plain ===")
+        async for chunk in provider.stream(test_msgs_plain):
+            if chunk.reasoning_content:
+                print("[reasoning]", chunk.reasoning_content, end="")
+            if chunk.content:
+                print(chunk.content, end="")
+            if chunk.tool_calls:
+                print("\nTool Calls:", chunk.tool_calls)
+        print("\n")
+
+        print("\n=== LiteLLMProvider stream: with tool ===")
+        async for chunk in provider.stream(test_msgs_tool, tools=test_tools):
+            if chunk.reasoning_content:
+                print("[reasoning]", chunk.reasoning_content, end="")
+            if chunk.content:
+                print(chunk.content, end="")
+            if chunk.tool_calls:
+                print("\nTool Calls:", chunk.tool_calls)
+        print("\n")
+
+    asyncio.run(run_chat_test())
+    asyncio.run(run_stream_test())
