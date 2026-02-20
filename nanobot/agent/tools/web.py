@@ -5,7 +5,7 @@ import json
 import os
 import re
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 import httpx
 
@@ -44,7 +44,14 @@ def _validate_url(url: str) -> tuple[bool, str]:
 
 
 class WebSearchTool(Tool):
-    """Search the web using Brave Search API."""
+    """
+    Search the web.
+    
+    Priority order:
+    1. Brave Search API (if api_key provided)
+    2. DuckDuckGo HTML scraping (no API key needed)
+    3. Google HTML scraping (fallback)
+    """
     
     name = "web_search"
     description = "Search the web. Returns titles, URLs, and snippets."
@@ -62,33 +69,159 @@ class WebSearchTool(Tool):
         self.max_results = max_results
     
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
-        if not self.api_key:
-            return "Error: BRAVE_API_KEY not configured"
-        
-        try:
-            n = min(max(count or self.max_results, 1), 10)
-            async with httpx.AsyncClient() as client:
-                r = await client.get(
-                    "https://api.search.brave.com/res/v1/web/search",
-                    params={"q": query, "count": n},
-                    headers={"Accept": "application/json", "X-Subscription-Token": self.api_key},
-                    timeout=10.0
-                )
-                r.raise_for_status()
-            
-            results = r.json().get("web", {}).get("results", [])
-            if not results:
-                return f"No results for: {query}"
-            
-            lines = [f"Results for: {query}\n"]
-            for i, item in enumerate(results[:n], 1):
-                lines.append(f"{i}. {item.get('title', '')}\n   {item.get('url', '')}")
-                if desc := item.get("description"):
-                    lines.append(f"   {desc}")
-            return "\n".join(lines)
-        except Exception as e:
-            return f"Error: {e}"
+        n = min(max(count or self.max_results, 1), 10)
 
+        # Build parser list based on available credentials
+        parsers = []
+        if self.api_key:
+            parsers.append(self._brave)
+        parsers.extend([self._ddg, self._google])
+
+        # Try each parser in order
+        for parser in parsers:
+            try:
+                results = await parser(query, n)
+                if results:
+                    return self._format(query, results[:n])
+            except Exception:
+                continue
+
+        return f"No results for: {query}"
+
+    async def _brave(self, query: str, n: int) -> list[dict]:
+        """Search using Brave Search API."""
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                params={"q": query, "count": n},
+                headers={
+                    "Accept": "application/json",
+                    "X-Subscription-Token": self.api_key,
+                },
+                timeout=10.0,
+            )
+            r.raise_for_status()
+
+        results = r.json().get("web", {}).get("results", [])
+        if not results:
+            return []
+        
+        else: 
+            total_res = []
+            for item in results[:n]:
+                total_res.append({
+                    "title": item.get("title", ""),
+                    "url": item.get("url", ""),
+                    "snippet": item.get("description", ""),
+                })
+            return total_res
+
+    async def _tavily(self, query: str, n: int) -> list[dict]:
+        """Search using Tavily Search API."""
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                "https://api.tavily.com/search",
+                json={
+                    "api_key": self.api_key,
+                    "query": query,
+                    "max_results": n,
+                    "include_answer": False,
+                    "include_raw_content": False,
+                },
+                timeout=15.0
+            )
+            r.raise_for_status()
+
+        data = r.json()
+
+        total_res = []
+        for item in data.get("results", [])[:n]:
+            total_res.append({
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "snippet": item.get("content", ""),
+            })
+            return total_res
+        
+    async def _ddg(self, query: str, n: int) -> list[dict]:
+        """Scrape DuckDuckGo HTML version."""
+        async with httpx.AsyncClient(follow_redirects=True, max_redirects=MAX_REDIRECTS) as c:
+            r = await c.get(
+                "https://html.duckduckgo.com/html/",
+                params={"q": query},
+                headers={"User-Agent": USER_AGENT},
+                timeout=10.0,
+            )
+            r.raise_for_status()
+
+        results = []
+        for block in re.findall(
+            r'<div[^>]*class="[^"]*result\b[^"]*"[^>]*>([\s\S]*?)</div>\s*(?=<div[^>]*class="[^"]*result|$)',
+            r.text,
+        ):
+            m_link = re.search(
+                r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>',
+                block,
+            )
+            if not m_link:
+                continue
+
+            raw_url = html.unescape(m_link.group(1))
+            actual = re.search(r'uddg=([^&]+)', raw_url)
+            url = html.unescape(unquote(actual.group(1))) if actual else raw_url
+            title = _strip_tags(m_link.group(2))
+
+            m_snip = re.search(
+                r'<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)</a>', block
+            )
+            snippet = _strip_tags(m_snip.group(1)) if m_snip else ""
+
+            if title and url:
+                results.append({"title": title, "url": url, "snippet": snippet})
+            if len(results) >= n:
+                break
+
+        return results
+
+    async def _google(self, query: str, n: int) -> list[dict]:
+        """Fallback: scrape Google search HTML."""
+        async with httpx.AsyncClient(follow_redirects=True, max_redirects=MAX_REDIRECTS) as c:
+            r = await c.get(
+                "https://www.google.com/search",
+                params={"q": query, "num": n, "hl": "en"},
+                headers={"User-Agent": USER_AGENT},
+                timeout=10.0,
+            )
+            r.raise_for_status()
+
+        results = []
+        for m in re.finditer(r'<a[^>]+href="/url\?q=([^&"]+)[^"]*"[^>]*>', r.text):
+            url = unquote(m.group(1))
+            if not url.startswith("http"):
+                continue
+
+            start = m.end()
+            chunk = r.text[start:start + 500]
+            h3 = re.search(r'<h3[^>]*>([\s\S]*?)</h3>', chunk)
+            title = _strip_tags(h3.group(1)) if h3 else url
+
+            span = re.search(r'<span[^>]*>([\s\S]{20,}?)</span>', chunk)
+            snippet = _strip_tags(span.group(1)) if span else ""
+
+            results.append({"title": title, "url": url, "snippet": snippet})
+            if len(results) >= n:
+                break
+
+        return results
+
+    @staticmethod
+    def _format(query: str, results: list[dict]) -> str:
+        lines = [f"Results for: {query}\n"]
+        for i, r in enumerate(results, 1):
+            lines.append(f"{i}. {r['title']}\n   {r['url']}")
+            if r.get("snippet"):
+                lines.append(f"   {r['snippet']}")
+        return "\n".join(lines)
 
 class WebFetchTool(Tool):
     """Fetch and extract content from a URL using Readability."""
